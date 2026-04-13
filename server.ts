@@ -1,29 +1,23 @@
 import { serveStatic } from "hono/bun";
 import type { ViteDevServer } from "vite";
 import { createServer as createViteServer } from "vite";
-import config from "./zosite.json";
 import { Hono } from "hono";
-import type { TornMember, SharedTarget } from "./src/types";
+import type { TornMember } from "./src/types";
 import enemiesData from "./src/data/enemies.json" assert { type: "json" };
 
-type Mode = "development" | "production";
 const app = new Hono();
-const mode: Mode = process.env.NODE_ENV === "production" ? "production" : "development";
+const mode: "development" | "production" = process.env.NODE_ENV === "production" ? "production" : "development";
 
-// ─── In-memory store ─────────────────────────────────────────────────────────
-let sharedTargets: SharedTarget[] = [];
-
-// ─── Config ──────────────────────────────────────────────────────────────────
-const TORN_API = "https://api.torn.com";
+// ─── Config ─────────────────────────────────────────────────────────────────
 const TORN_KEY = process.env.TORN_API_KEY ?? "";
 const FFSCOUT_KEY = "TmljODt3hutU7dWT";
 const CACHE_TTL_MS = 30_000;
 
-// ─── Enemy faction from local JSON ───────────────────────────────────────────
-const ENEMY_IDS = (enemiesData as any[]).map((e: any) => e.id);
-const ENEMY_MAP = new Map((enemiesData as any[]).map((e: any) => [e.id, e]));
+// ─── Data ─────────────────────────────────────────────────────────────────
+const ENEMY_MAP = new Map<number, any>();
+for (const e of enemiesData as any[]) ENEMY_MAP.set(e.id, e);
 
-// ─── Profile cache ────────────────────────────────────────────────────────────
+// ─── Cache ─────────────────────────────────────────────────────────────────
 interface CacheEntry { data: any; fetchedAt: number }
 const profileCache = new Map<number, CacheEntry>();
 function getCached(id: number) {
@@ -33,197 +27,131 @@ function getCached(id: number) {
   return undefined;
 }
 
-// ─── Torn API ─────────────────────────────────────────────────────────────────
-async function tornGet<T>(path: string, key?: string): Promise<T> {
-  const k = key ?? TORN_KEY;
-  if (!k) throw new Error("No Torn API key");
-  const r = await fetch(`${TORN_API}${path}`, {
-    headers: { Authorization: `ApiKey ${k}`, Accept: "application/json" },
+// ─── Torn API ─────────────────────────────────────────────────────────────
+async function tornGet<T>(path: string): Promise<T> {
+  if (!TORN_KEY) throw new Error("No Torn API key");
+  const r = await fetch(`https://api.torn.com${path}`, {
+    headers: { Authorization: `ApiKey ${TORN_KEY}`, Accept: "application/json" },
   });
   if (!r.ok) throw new Error(`Torn ${r.status}`);
   return r.json() as Promise<T>;
 }
 
-// ─── FFScout ──────────────────────────────────────────────────────────────────
+// ─── FFScout ─────────────────────────────────────────────────────────────
 interface FFSResult {
-  player_id: number; name?: string; level?: number; rank?: string;
-  bs_estimate: number; bs_estimate_human: string; fair_fight: number;
-  last_updated: number; last_updated_relative: string;
+  player_id: number; bs_estimate: number; bs_estimate_human: string;
+  fair_fight: number; last_updated_relative: string;
 }
-
 async function fetchFFScout(ids: number[]): Promise<Map<number, FFSResult>> {
   const map = new Map<number, FFSResult>();
-  const targets = ids.join(",");
-  const r = await fetch(`https://ffscouter.com/api/v1/get-stats?key=${FFSCOUT_KEY}&targets=${targets}`);
+  const r = await fetch(
+    `https://ffscouter.com/api/v1/get-stats?key=${FFSCOUT_KEY}&targets=${ids.join(",")}`
+  );
   if (!r.ok) return map;
   const arr: FFSResult[] = await r.json();
   for (const e of arr) map.set(e.player_id, e);
   return map;
 }
 
-// ─── Torn profiles ─────────────────────────────────────────────────────────────
-async function fetchProfiles(ids: number[], key: string): Promise<Map<number, any>> {
-  const map = new Map<number, any>();
-  for (const id of ids) {
-    const cached = getCached(id);
-    if (cached) { map.set(id, cached); continue; }
-    try {
-      await new Promise((r) => setTimeout(r, 130));
-      const d = await tornGet<any>(`/v2/user/${id}?selections=profile`, key);
-      const p = d.profile ?? d;
-      if (p?.id) { profileCache.set(id, { data: p, fetchedAt: Date.now() }); map.set(id, p); }
-    } catch { /* skip */ }
-  }
-  return map;
+// ─── Status parser ─────────────────────────────────────────────────────────
+function parseTornStatus(p: any) {
+  const s = (p as any).status;
+  if (!s) return { status: "Unknown", statusDescription: "", activity: "Offline" };
+  const cur: string = s.current ?? "";
+  const desc: string = s.description ?? "";
+  if (cur === "Hospital") return { status: "Hospital", statusDescription: "Hospital", activity: "Hospital" };
+  if (cur === "Okay")      return { status: "Okay", statusDescription: "Okay", activity: "Okay" };
+  if (cur === "Traveling" || cur === "Abroad") return { status: "Traveling", statusDescription: desc, activity: "Traveling" };
+  if (cur === "Idle") return { status: "Idle", statusDescription: desc, activity: "Idle" };
+  return { status: "Offline", statusDescription: desc, activity: "Offline" };
 }
 
-// ─── Map combined data → TornMember ─────────────────────────────────────────
-function mapMember(id: number, profile: any | undefined, ffs: FFSResult | undefined): TornMember {
-  const now = Math.floor(Date.now() / 1000);
-  const ts = profile?.status as any;
-  const la = (profile as any)?.last_action as any;
-  const rawState = ts?.state ?? ts?.current ?? ts?.description ?? "Offline";
-  const stateMap: Record<string, string> = {
-    Okay: "Okay", Hospital: "Hospital", Traveling: "Traveling",
-    Abroad: "Abroad", "In jail": "In jail", "In federal": "In federal",
-  };
-  const activity = stateMap[rawState] ?? "Offline";
-  let statusDescription = ts?.description ?? "";
-  if (rawState === "Hospital" && ts?.until) {
-    const s = Math.max(0, ts.until - now);
-    statusDescription = `${Math.floor(s / 60)}m ${s % 60}s`;
-  } else if (rawState === "Okay" || rawState === "Hospital") {
-    statusDescription = rawState;
-  }
-  const bstatsAge = ffs?.last_updated
-    ? new Date(ffs.last_updated * 1000).toLocaleDateString()
-    : ffs?.last_updated_relative ?? null;
+// ─── Build member list ──────────────────────────────────────────────────────
+async function buildMemberList(ids: number[]): Promise<TornMember[]> {
+  const [ffsMap, profiles] = await Promise.all([
+    fetchFFScout(ids),
+    Promise.all(ids.map(async (id) => {
+      const cached = getCached(id);
+      if (cached) return { id, profile: cached };
+      try {
+        const profile = await tornGet<any>(`/v2/user/${id}?selections=profile`);
+        profileCache.set(id, { data: profile, fetchedAt: Date.now() });
+        return { id, profile };
+      } catch { return { id, profile: null }; }
+    })),
+  ]);
 
-  return {
-    id,
-    name: ffs?.name ?? profile?.name ?? String(id),
-    level: profile?.level ?? ffs?.level ?? 0,
-    rank: ffs?.rank ?? profile?.rank ?? "",
-    bstats: ffs?.bs_estimate ?? 0,
-    bstats_display: ffs?.bs_estimate_human ?? null,
-    fairFight: ffs?.fair_fight ?? null,
-    bstats_age: bstatsAge,
-    position: ffs?.position ?? profile?.role ?? "",
-    status: activity as any,
-    statusDescription,
-    lastAction: la?.timestamp ?? 0,
-    lastActionRelative: la?.relative ?? "",
-    activity: activity as any,
-    attacks: profile?.attacks_filter?.length ?? 0,
-    useref: la?.timestamp ?? 0,
-  };
+  return ids.map((id) => {
+    const base = ENEMY_MAP.get(id) ?? { id, name: "Unknown", bstats_display: "?" };
+    const ffs = ffsMap.get(id);
+    const profile = (profiles.find(p => p.id === id)?.profile) as any;
+    const { status, statusDescription, activity } = profile ? parseTornStatus(profile) : { status: "Unknown" as any, statusDescription: "", activity: "Unknown" as any };
+    const lastAct = (profile as any)?.last_action;
+    return {
+      id, name: base.name, level: 0, rank: base.rank ?? "", bstats: ffs?.bs_estimate ?? 0,
+      fairFight: ffs?.fair_fight ?? 0, position: "",
+      status: status as TornMember["status"], statusDescription,
+      lastAction: lastAct?.timestamp ?? 0,
+      lastActionRelative: lastAct?.relative ?? ffs?.last_updated_relative ?? "",
+      activity: activity as TornMember["activity"], attacks: 0, useref: lastAct?.timestamp ?? 0,
+    };
+  });
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
-
-// GET /api/faction — Hellfire Club (enemies.json + FFScout + Torn live status)
-app.get("/api/faction", async (c) => {
-  const userKey = c.req.query("key") || undefined;
-  const key = userKey ?? TORN_KEY;
-  if (!key) return c.json({ error: "No Torn API key" }, 503);
-  try {
-    const [ffsMap, profileMap] = await Promise.all([
-      fetchFFScout(ENEMY_IDS),
-      fetchProfiles(ENEMY_IDS, key),
-    ]);
-    return c.json(ENEMY_IDS.map((id: number) => mapMember(id, profileMap.get(id), ffsMap.get(id))));
-  } catch (e) {
-    return c.json({ error: (e as Error).message }, 500);
-  }
+// ─── Routes ────────────────────────────────────────────────────────────────
+app.get("/api/war-faction", async (c) => {
+  try { return c.json(await buildMemberList(Array.from(ENEMY_MAP.keys()))); }
+  catch (e) { return c.json({ error: e instanceof Error ? e.message : "Error" }, 500); }
 });
-
-// GET /api/me
+app.get("/api/war-targets", async (c) => c.json([]));
 app.get("/api/me", async (c) => {
   const key = c.req.query("key");
   if (!key) return c.json({ error: "Missing key" }, 400);
   try {
-    const d = await tornGet<any>(`/v2/user?selections=battlestats`, key);
-    return c.json({ id: d.id, name: d.name, bstats: d.battlestats?.total ?? 0 });
-  } catch (e) {
-    return c.json({ error: (e as Error).message }, 500);
-  }
+    const data = await tornGet<any>(`/v2/user?selections=battlestats`);
+    return c.json({ id: data.id, name: data.name, bstats: data.battlestats?.total ?? 0 });
+  } catch (e) { return c.json({ error: e instanceof Error ? e.message : "Error" }, 500); }
 });
-
-// GET /api/targets
-app.get("/api/targets", async (c) => {
-  const userKey = c.req.query("key") || undefined;
-  const key = userKey ?? TORN_KEY;
-  const ids = sharedTargets.map((t) => t.id);
-  if (!ids.length) return c.json([]);
-  const [ffsMap, profileMap] = await Promise.all([fetchFFScout(ids), fetchProfiles(ids, key)]);
-  return c.json(ids.map((id: number) => mapMember(id, profileMap.get(id), ffsMap.get(id))));
-});
-
-// PUT /api/targets/shared
 app.put("/api/targets/shared", async (c) => {
   const { ids } = await c.req.json<{ ids: number[] }>();
-  const fresh = (ids ?? []).filter((n) => Number.isInteger(n) && n > 0 && !sharedTargets.some((t) => t.id === n));
-  sharedTargets.push(...fresh.map((id) => ({ id })));
-  return c.json({ ok: true, count: sharedTargets.length });
-});
-
-// DELETE /api/targets/shared?id=X
-app.delete("/api/targets/shared", async (c) => {
-  const id = parseInt(c.req.query("id") ?? "0", 10);
-  sharedTargets = sharedTargets.filter((t) => t.id !== id);
   return c.json({ ok: true });
 });
 
-// ─── Dev / Prod setup ─────────────────────────────────────────────────────────
-if (mode === "production") configureProduction(app);
-else await configureDevelopment(app);
+// ─── Mode-specific routing ──────────────────────────────────────────────────
+async function configureDev(): Promise<ViteDevServer> {
+  const vite = await createViteServer({ server: { middlewareMode: true, hmr: false, ws: false }, appType: "custom" });
+  app.use("*", async (c, next) => {
+    if (c.req.path.startsWith("/api/")) return next();
+    const url = c.req.path;
+    if (url === "/" || url === "/index.html") {
+      let t = await Bun.file("./index.html").text();
+      t = await vite.transformIndexHtml(url, t);
+      return c.html(t, { headers: { "Cache-Control": "no-store" } });
+    }
+    const pf = Bun.file(`./public${url}`);
+    if (await pf.exists() && !(await pf.stat()).isDirectory())
+      return new Response(pf, { headers: { "Cache-Control": "no-store" } });
+    let r; try { r = await vite.transformRequest(url); } catch { r = null; }
+    if (r) return new Response(r.code, { headers: { "Content-Type": "application/javascript", "Cache-Control": "no-store" } });
+    let t = await Bun.file("./index.html").text();
+    return c.html(await vite.transformIndexHtml("/", t), { headers: { "Cache-Control": "no-store" } });
+  });
+  return vite;
+}
 
-const port = process.env.PORT
-  ? parseInt(process.env.PORT, 10)
-  : mode === "production"
-    ? (config.publish?.published_port ?? config.local_port)
-    : config.local_port;
-
-export default { fetch: app.fetch, port, idleTimeout: 255 };
-
-function configureProduction(app: Hono) {
+function configureProd() {
   app.use("/assets/*", serveStatic({ root: "./dist" }));
-  app.get("/favicon.ico", (c) => c.redirect("/favicon.svg", 302));
   app.use(async (c, next) => {
     if (c.req.method !== "GET") return next();
     const path = c.req.path;
     if (path.startsWith("/api/") || path.startsWith("/assets/")) return next();
     const file = Bun.file(`./dist${path}`);
-    if (await file.exists()) { const s = await file.stat(); if (s && !s.isDirectory()) return new Response(file); }
+    if (await file.exists() && !(await file.stat()).isDirectory()) return new Response(file);
     return serveStatic({ path: "./dist/index.html" })(c, next);
   });
 }
 
-async function configureDevelopment(app: Hono): Promise<ViteDevServer> {
-  const vite = await createViteServer({ server: { middlewareMode: true, hmr: false, ws: false }, appType: "custom" });
-  app.use("*", async (c, next) => {
-    if (c.req.path.startsWith("/api/")) return next();
-    if (c.req.path === "/favicon.ico") return c.redirect("/favicon.svg", 302);
-    const url = c.req.path;
-    try {
-      if (url === "/" || url === "/index.html") {
-        let t = await Bun.file("./index.html").text();
-        t = await vite.transformIndexHtml(url, t);
-        return c.html(t, { headers: { "Cache-Control": "no-store" } });
-      }
-      const pf = Bun.file(`./public${url}`);
-      if (await pf.exists()) { const s = await pf.stat(); if (s && !s.isDirectory()) return new Response(pf, { headers: { "Cache-Control": "no-store" } }); }
-      let result;
-      try { result = await vite.transformRequest(url); } catch { result = null; }
-      if (result) return new Response(result.code, { headers: { "Content-Type": "application/javascript", "Cache-Control": "no-store" } });
-      let t = await Bun.file("./index.html").text();
-      t = await vite.transformIndexHtml("/", t);
-      return c.html(t, { headers: { "Cache-Control": "no-store" } });
-    } catch (err) {
-      vite.ssrFixStacktrace(err as Error);
-      console.error(err);
-      return c.text("Internal Server Error", 500);
-    }
-  });
-  return vite;
-}
+if (mode === "production") { configureProd(); } else { await configureDev(); }
+
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : (mode === "production" ? 54737 : 56212);
+export default { fetch: app.fetch, port: PORT, idleTimeout: 255 };
