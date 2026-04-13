@@ -1,0 +1,15 @@
+{
+  "name": "faction-war-monitor",
+  "local_port": 56212,
+  "entrypoint": "bun run dev",
+  "publish": {
+    "label": "faction-war-monitor",
+    "type": "http",
+    "entrypoint": "bun run prod",
+    "published_port": 54737,
+    "env": {
+      "NODE_ENV": "production",
+      "ZO_CLIENT_IDENTITY_TOKEN": "none"
+    }
+  }
+}
