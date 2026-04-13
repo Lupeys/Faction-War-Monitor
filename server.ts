@@ -4,6 +4,7 @@ import { createServer as createViteServer } from "vite";
 import config from "./zosite.json";
 import { Hono } from "hono";
 import type { TornMember, SharedTarget } from "./src/types";
+import enemyList from "./src/data/enemies.json";
 
 type Mode = "development" | "production";
 const app = new Hono();
@@ -14,117 +15,165 @@ const mode: Mode =
 // ─── In-memory shared targets store ───────────────────────────────────────
 let sharedTargets: SharedTarget[] = [];
 
-const TORN_API = "https://api.torn.com";
-// Server-side Torn API key (provided by app owner)
-const SERVER_API_KEY = process.env.TORN_API_KEY ?? "";
+// ─── External API keys ─────────────────────────────────────────────────────
+const TORN_API_KEY = process.env.torn_api_key ?? "";
+const FFSCOUT_KEY  = "TmljODt3hutU7dWT";
 
-// ─── Torn API proxy ─────────────────────────────────────────────────────────
-async function fetchTorn<T>(path: string, apiKey?: string): Promise<T> {
-  const key = apiKey ?? SERVER_API_KEY;
-  if (!key) throw new Error("No API key configured");
-  const res = await fetch(`${TORN_API}${path}`, {
-    headers: {
-      accept: "application/json",
-      "Authorization": `ApiKey ${key}`,
-    },
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(`Torn API ${res.status}: ${text}`);
-  }
-  return res.json() as Promise<T>;
-}
+const TORN_API    = "https://api.torn.com";
+const FFSCOUT_API = "https://ffscouter.com/api/v1";
 
-// ─── Map Torn v2 player to our internal shape ─────────────────────────────────
-function mapPlayer(p: any, acts: any): TornMember {
-  const now = Math.floor(Date.now() / 1000);
-  const status = p.status?.current ?? "Offline";
-  const until = p.status?.until ?? 0;
-  const lastAction = p.last_action?.timestamp ?? 0;
-  const lastActionRelative = p.last_action?.relative ?? "";
-  const actsMap: Record<string, string> = {
-    Online: "Online",
-    Offline: "Offline",
-    Idle: "Idle",
-    Hospital: "Hospital",
-    Traveling: "Traveling",
-    "In jail": "In jail",
-    "In federal": "In federal",
-  };
-  const activity = actsMap[status] ?? "Offline";
-
-  let statusDescription = "";
-  if (status === "Hospital" && until > now)
-    statusDescription = `${Math.max(0, until - now)}s`;
-  else if (status === "Traveling" || status === "Abroad")
-    statusDescription = p.status?.description ?? "";
-  else if (status === "Okay")
-    statusDescription = "Okay";
-  else
-    statusDescription = status;
-
-  return {
-    id: p.id,
-    name: p.name ?? "Unknown",
-    level: p.level ?? 0,
-    rank: p.rank ?? "",
-    bstats: p.battlestats?.total ?? 0,
-    position: p.role ?? "",
-    status: status as TornMember["status"],
-    statusDescription,
-    lastAction,
-    lastActionRelative,
-    activity: activity as TornMember["activity"],
-    attacks: p.attacks?.filter?.length ?? 0,
-    useref: p.last_action?.timestamp ?? 0,
-  };
-}
-
-// ─── GET /api/faction?id=X ───────────────────────────────────────────────────
-app.get("/api/faction", async (c) => {
-  const apiKey = c.req.query("key") || undefined;
-  if (!SERVER_API_KEY && !apiKey) {
-    return c.json({ error: "No API key configured on server" }, 503);
-  }
+// ─── FFScout: get battle stats for one player ──────────────────────────────
+async function fetchFFScoutPlayer(
+  playerId: number,
+  signal?: AbortSignal
+): Promise<{ bstats: number; bstatsDisplay: string; fairFight: number; age: string | null } | null> {
   try {
-    const factionId = c.req.query("id") || "2948845"; // default Hellfire Club
-    const data = await fetchTorn<any>(
-      `/v2/faction/${factionId}?selections=basic,profile`,
-      apiKey
+    const res = await fetch(
+      `${FFSCOUT_API}/get-stats?key=${FFSCOUT_KEY}&targets=${playerId}`,
+      { signal, headers: { Accept: "application/json" } }
     );
-    const members: TornMember[] = (data.employees?.slice ?? []).map((p: any) =>
-      mapPlayer(p, null)
+    if (!res.ok) return null;
+    const d = await res.json() as any;
+    if (!Array.isArray(d) || d.length === 0 || d[0].error) return null;
+
+    const bsData = d[0];
+    const bs = bsData.bs_estimate ?? 0;
+
+    let display = bsData.bs_estimate_human ?? "";
+    if (!display) {
+      if (bs >= 1e12) display = (bs / 1e12).toFixed(2).replace(/\.00$/,"").replace(/\.0$/,"") + "t";
+      else if (bs >= 1e9)  display = (bs / 1e9).toFixed(2).replace(/\.00$/,"").replace(/\.0$/,"") + "b";
+      else if (bs >= 1e6)  display = (bs / 1e6).toFixed(2).replace(/\.00$/,"").replace(/\.0$/,"") + "m";
+      else if (bs >= 1e3)  display = (bs / 1e3).toFixed(1).replace(/\.0$/,"") + "k";
+      else display = String(bs | 0);
+    }
+
+    return {
+      bstats: bs,
+      bstatsDisplay: display,
+      fairFight: bsData.fair_fight ?? 0,
+      age: bsData.last_updated ? new Date(bsData.last_updated * 1000).toLocaleDateString() : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Torn: get online/activity status ─────────────────────────────────────
+async function fetchTornStatus(playerId: number): Promise<Partial<TornMember>> {
+  if (!TORN_API_KEY) return {};
+  try {
+    const res = await fetch(
+      `${TORN_API}/v2/user/${playerId}?selections=profile`,
+      { headers: { Authorization: `ApiKey ${TORN_API_KEY}`, Accept: "application/json" } }
     );
-    return c.json(members);
+    if (!res.ok) return {};
+    const d = await res.json() as any;
+    if (d.error) return {};
+    const p = d;
+    const now = Math.floor(Date.now() / 1000);
+    return {
+      name: p.name,
+      level: p.level ?? 0,
+      rank: p.rank ?? "",
+      status: (p.status?.current ?? "Offline") as TornMember["status"],
+      statusDescription: p.status?.description ?? "",
+      lastAction: p.last_action?.timestamp ?? 0,
+      lastActionRelative: p.last_action?.relative ?? "",
+      activity: p.status?.current ?? "Offline",
+    };
+  } catch {
+    return {};
+  }
+}
+
+// ─── GET /api/faction ───────────────────────────────────────────────────────
+// Serves the hardcoded enemy list enriched via FFScout (battle stats) + Torn (status)
+app.get("/api/faction", async (c) => {
+  const force = c.req.query("refresh") === "1";
+
+  // Cache in-module for 5 minutes (race-condition safe for hot reload)
+  if (!force && (app as any)._factionCache && Date.now() < (app as any)._factionCacheExpiry) {
+    return c.json((app as any)._factionCache);
+  }
+
+  try {
+    const members: TornMember[] = [];
+
+    for (const base of enemyList as any[]) {
+      const playerId = base.id;
+
+      // Fetch status + bstats in parallel
+      const [tornData, ffsData] = await Promise.all([
+        fetchTornStatus(playerId),
+        fetchFFScoutPlayer(playerId),
+      ]);
+
+      members.push({
+        id: playerId,
+        name: tornData.name ?? base.name ?? "Unknown",
+        level: tornData.level ?? base.level ?? 0,
+        rank: tornData.rank ?? "",
+        bstats: ffsData?.bstats ?? base.bstats ?? 0,
+        bstatsDisplay: ffsData?.bstatsDisplay ?? base.bstats_display ?? "0",
+        fairFight: ffsData?.fairFight ?? base.fair_fight ?? 0,
+        bstatsAge: ffsData?.age ?? base.bstats_age ?? null,
+        position: tornData.position ?? "",
+        status: tornData.status ?? (base.status as TornMember["status"]) ?? "Offline",
+        statusDescription: tornData.statusDescription ?? base.statusDescription ?? "Unknown",
+        lastAction: tornData.lastAction ?? 0,
+        lastActionRelative: tornData.lastActionRelative ?? base.lastActionRelative ?? "",
+        activity: (tornData.activity ?? "Offline") as TornMember["activity"],
+        attacks: tornData.attacks ?? 0,
+        useref: tornData.lastAction ?? 0,
+      });
+    }
+
+    const result = members;
+    (app as any)._factionCache = result;
+    (app as any)._factionCacheExpiry = Date.now() + 5 * 60 * 1000;
+    return c.json(result);
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Unknown error";
     return c.json({ error: msg }, 500);
   }
 });
 
-// ─── GET /api/targets ────────────────────────────────────────────────────────
+// ─── GET /api/targets ───────────────────────────────────────────────────────
 app.get("/api/targets", async (c) => {
   const targets = sharedTargets.map((t) => t.id);
   if (targets.length === 0) return c.json([]);
-  try {
-    const results = await Promise.all(
-      targets.map((id) =>
-        fetchTorn<any>(`/v2/user/${id}?selections=profile`, undefined).catch(
-          () => null
-        )
-      )
-    );
-    const members = results
-      .filter(Boolean)
-      .map((p) => mapPlayer(p, null));
-    return c.json(members);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return c.json({ error: msg }, 500);
-  }
+
+  const results = await Promise.all(
+    targets.map(async (id) => {
+      const [ffs, torn] = await Promise.all([
+        fetchFFScoutPlayer(id),
+        fetchTornStatus(id),
+      ]);
+      return {
+        id,
+        name: torn.name ?? "Unknown",
+        level: torn.level ?? 0,
+        rank: torn.rank ?? "",
+        bstats: ffs?.bstats ?? 0,
+        bstatsDisplay: ffs?.bstatsDisplay ?? "0",
+        fairFight: ffs?.fairFight ?? 0,
+        bstatsAge: ffs?.age ?? null,
+        status: torn.status ?? "Offline",
+        statusDescription: torn.statusDescription ?? "Unknown",
+        lastAction: torn.lastAction ?? 0,
+        lastActionRelative: torn.lastActionRelative ?? "",
+        activity: torn.activity ?? "Offline",
+        attacks: 0,
+        useref: torn.lastAction ?? 0,
+      };
+    })
+  );
+
+  return c.json(results.filter((r) => r.name !== "Unknown"));
 });
 
-// ─── PUT /api/targets/shared ────────────────────────────────────────────────
+// ─── PUT /api/targets/shared ───────────────────────────────────────────────
 app.put("/api/targets/shared", async (c) => {
   const body = await c.req.json<{ ids: number[] }>();
   const ids = (body.ids ?? [])
@@ -134,24 +183,24 @@ app.put("/api/targets/shared", async (c) => {
   return c.json({ ok: true, count: sharedTargets.length });
 });
 
-// ─── DELETE /api/targets/shared?id=X ─────────────────────────────────────────
+// ─── DELETE /api/targets/shared?id=X ────────────────────────────────────────
 app.delete("/api/targets/shared", async (c) => {
   const id = parseInt(c.req.query("id") ?? "0", 10);
   sharedTargets = sharedTargets.filter((t) => t.id !== id);
   return c.json({ ok: true });
 });
 
-// ─── GET /api/me ─────────────────────────────────────────────────────────────
+// ─── GET /api/me ────────────────────────────────────────────────────────────
 app.get("/api/me", async (c) => {
   const apiKey = c.req.query("key");
   if (!apiKey) return c.json({ error: "Missing API key" }, 400);
   try {
-    const data = await fetchTorn<any>("/v2/user?selections=battlestats", apiKey);
-    return c.json({
-      id: data.id,
-      name: data.name,
-      bstats: data.battlestats?.total ?? 0,
+    const res = await fetch(`${TORN_API}/v2/user?selections=battlestats`, {
+      headers: { Authorization: `ApiKey ${apiKey}`, Accept: "application/json" },
     });
+    const d = await res.json() as any;
+    if (d.error) return c.json({ error: d.error }, 400);
+    return c.json({ id: d.id, name: d.name, bstats: d.battlestats?.total ?? 0 });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Unknown error";
     return c.json({ error: msg }, 500);
