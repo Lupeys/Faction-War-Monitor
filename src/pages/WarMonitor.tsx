@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useMembers } from "@/hooks/useMembers";
 import { useFilters } from "@/hooks/useFilters";
 import { FilterPills } from "@/components/FilterPills";
@@ -7,6 +7,7 @@ import type { TornMember, FilterTab, ViewMode } from "@/types";
 
 const API_KEY_STORAGE = "war-monitor-apikey";
 const MYPERSONAL_BSTATS_STORAGE = "war-monitor-mystats";
+const AUTO_REFRESH_INTERVAL = 30;
 
 function formatBstats(n: number): string {
   if (!Number.isFinite(n)) return "0";
@@ -51,14 +52,33 @@ export function WarMonitorPage() {
   const [myBstats, setMyBstats] = useState<number | null>(null);
   const [personalApiKey, setPersonalApiKey] = useState<string>("");
   const [showApiInput, setShowApiInput] = useState(false);
-  const [targetInput, setTargetInput] = useState("");
-  const [sharedToken, setSharedToken] = useState("");
+  const [targetInput, setTargetInput] = useState<string>("");
+  const [sharedToken, setSharedToken] = useState<string>("");
   const [addingTarget, setAddingTarget] = useState(false);
   const [addingError, setAddingError] = useState<string | null>(null);
+  const [secondsLeft, setSecondsLeft] = useState(AUTO_REFRESH_INTERVAL);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const { members, loading, error, lastUpdated, refresh } = useMembers({ mode: viewMode });
   const { filters } = useFilters();
 
+  // Auto-refresh countdown
+  useEffect(() => {
+    setSecondsLeft(AUTO_REFRESH_INTERVAL);
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    intervalRef.current = setInterval(() => {
+      setSecondsLeft((s) => {
+        if (s <= 1) {
+          refresh();
+          return AUTO_REFRESH_INTERVAL;
+        }
+        return s - 1;
+      });
+    }, 1000);
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+  }, [refresh]);
+
+  // Load persisted values
   useEffect(() => {
     try {
       const key = localStorage.getItem(API_KEY_STORAGE);
@@ -119,25 +139,39 @@ export function WarMonitorPage() {
     ? lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
     : null;
 
+  const hospitalCount = counts.hospital ?? 0;
+  const travelCount = counts.travel ?? 0;
+
   return (
     <div className="mx-auto max-w-lg px-4 py-6 pb-24">
-      <div className="mb-6 flex items-start justify-between">
+      {/* Header */}
+      <div className="mb-4 flex items-start justify-between">
         <div>
-          <h1 className="text-xl font-bold text-zinc-100">Hellfire War Monitor</h1>
-          <p className="mt-0.5 text-sm text-zinc-500">
-            {viewMode === "faction" ? "Opposing faction" : "Chain targets"}
-            {lastUpdatedStr && <span className="ml-2 text-zinc-600">· {lastUpdatedStr}</span>}
+          <h1 className="text-xl font-bold text-zinc-100">🦄 Unicorn Apocalypse</h1>
+          <p className="mt-0.5 flex items-center gap-2 text-sm text-zinc-500">
+            <span className="text-red-400">🏥 {hospitalCount}</span>
+            <span className="text-yellow-400">✈️ {travelCount}</span>
+            {lastUpdatedStr && (
+              <span className="text-zinc-600">· {lastUpdatedStr}</span>
+            )}
           </p>
         </div>
-        <button
-          onClick={refresh}
-          disabled={loading}
-          className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:opacity-50"
-        >
-          {loading ? "Loading..." : "Refresh"}
-        </button>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-800 px-2.5 py-1.5 text-xs text-zinc-400">
+            <span className="inline-block h-1.5 w-1.5 rounded-full bg-green-400 animate-pulse" />
+            <span>{secondsLeft}s</span>
+          </div>
+          <button
+            onClick={() => { setSecondsLeft(AUTO_REFRESH_INTERVAL); refresh(); }}
+            disabled={loading}
+            className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:opacity-50"
+          >
+            {loading ? "..." : "Refresh"}
+          </button>
+        </div>
       </div>
 
+      {/* Mode toggle */}
       <div className="mb-4 flex gap-2">
         <button
           onClick={() => setViewMode("faction")}
@@ -161,6 +195,7 @@ export function WarMonitorPage() {
         </button>
       </div>
 
+      {/* Personal API key */}
       <div className="mb-5 rounded-xl border border-zinc-800 bg-zinc-900/80 p-4">
         <div className="mb-2 flex items-center justify-between">
           <span className="text-sm font-medium text-zinc-300">Your Battle Stats</span>
@@ -195,6 +230,7 @@ export function WarMonitorPage() {
         )}
       </div>
 
+      {/* Add targets */}
       {viewMode === "targets" && (
         <div className="mb-5 rounded-xl border border-zinc-800 bg-zinc-900/80 p-4">
           <div className="mb-2 flex items-center justify-between">
