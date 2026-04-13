@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useMembers } from "@/hooks/useMembers";
+import { useFilters } from "@/hooks/useFilters";
 import { FilterPills } from "@/components/FilterPills";
 import { MemberCard } from "@/components/MemberCard";
 import type { TornMember, FilterTab, ViewMode } from "@/types";
@@ -14,22 +15,6 @@ function formatBstats(n: number): string {
   if (n >= 1e6)  return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "m";
   if (n >= 1e3)  return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
   return String(n | 0);
-}
-
-function parseRelative(rel: string): number {
-  if (!rel) return Infinity;
-  const parts = rel.toLowerCase().split(" ");
-  let total = 0;
-  for (let i = 0; i < parts.length - 1; i += 2) {
-    const num = parseInt(parts[i] ?? "0", 10);
-    const unit = parts[i + 1] ?? "";
-    if (isNaN(num)) continue;
-    if (unit.startsWith("second")) total += num;
-    else if (unit.startsWith("minute")) total += num * 60;
-    else if (unit.startsWith("hour")) total += num * 3600;
-    else if (unit.startsWith("day")) total += num * 86400;
-  }
-  return total;
 }
 
 function countByTab(members: TornMember[]): Record<FilterTab, number> {
@@ -49,7 +34,7 @@ function countByTab(members: TornMember[]): Record<FilterTab, number> {
   return counts as Record<FilterTab, number>;
 }
 
-function filterMembers(members: TornMember[], myBstats: number | null, tab: FilterTab): TornMember[] {
+function filterMembers(members: TornMember[], _myBstats: number | null, tab: FilterTab): TornMember[] {
   return members.filter((m) => {
     if (tab === "hittable") return m.status === "Okay" || m.status === "Hospital";
     if (tab === "hospital") return m.status === "Hospital";
@@ -72,8 +57,8 @@ export function WarMonitorPage() {
   const [addingError, setAddingError] = useState<string | null>(null);
 
   const { members, loading, error, lastUpdated, refresh } = useMembers({ mode: viewMode });
+  const { filters } = useFilters();
 
-  // Load persisted values
   useEffect(() => {
     try {
       const key = localStorage.getItem(API_KEY_STORAGE);
@@ -128,7 +113,7 @@ export function WarMonitorPage() {
   }, [targetInput, sharedToken, refresh]);
 
   const counts = useMemo(() => countByTab(members), [members]);
-  const filtered = useMemo(() => filterMembers(members, myBstats, "hittable"), [members, myBstats]);
+  const filtered = useMemo(() => filterMembers(members, myBstats, filters.activeTab), [members, myBstats, filters.activeTab]);
 
   const lastUpdatedStr = lastUpdated
     ? lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
@@ -136,13 +121,12 @@ export function WarMonitorPage() {
 
   return (
     <div className="mx-auto max-w-lg px-4 py-6 pb-24">
-      {/* Header */}
       <div className="mb-6 flex items-start justify-between">
         <div>
           <h1 className="text-xl font-bold text-zinc-100">Hellfire War Monitor</h1>
-          <p className="text-sm text-zinc-500 mt-0.5">
+          <p className="mt-0.5 text-sm text-zinc-500">
             {viewMode === "faction" ? "Opposing faction" : "Chain targets"}
-            {lastUpdatedStr && <span className="ml-2 text-zinc-600">· Updated {lastUpdatedStr}</span>}
+            {lastUpdatedStr && <span className="ml-2 text-zinc-600">· {lastUpdatedStr}</span>}
           </p>
         </div>
         <button
@@ -154,7 +138,6 @@ export function WarMonitorPage() {
         </button>
       </div>
 
-      {/* Mode toggle */}
       <div className="mb-4 flex gap-2">
         <button
           onClick={() => setViewMode("faction")}
@@ -178,9 +161,8 @@ export function WarMonitorPage() {
         </button>
       </div>
 
-      {/* Personal API key section */}
       <div className="mb-5 rounded-xl border border-zinc-800 bg-zinc-900/80 p-4">
-        <div className="flex items-center justify-between mb-2">
+        <div className="mb-2 flex items-center justify-between">
           <span className="text-sm font-medium text-zinc-300">Your Battle Stats</span>
           {myBstats && (
             <span className="font-mono text-sm text-green-400">{formatBstats(myBstats)}</span>
@@ -213,7 +195,6 @@ export function WarMonitorPage() {
         )}
       </div>
 
-      {/* Add targets (chain targets mode) */}
       {viewMode === "targets" && (
         <div className="mb-5 rounded-xl border border-zinc-800 bg-zinc-900/80 p-4">
           <div className="mb-2 flex items-center justify-between">
@@ -244,24 +225,20 @@ export function WarMonitorPage() {
         </div>
       )}
 
-      {/* Filters */}
       <FilterPills counts={counts} />
 
-      {/* Error */}
       {error && (
         <div className="mt-4 rounded-lg border border-red-800 bg-red-900/30 px-4 py-3 text-sm text-red-400">
           {error}
         </div>
       )}
 
-      {/* Member count */}
       {!loading && !error && (
         <p className="mt-4 mb-3 text-xs text-zinc-600">
           Showing {filtered.length} of {members.length} members
         </p>
       )}
 
-      {/* Member cards */}
       <div className="space-y-3">
         {loading ? (
           <div className="flex justify-center py-12">

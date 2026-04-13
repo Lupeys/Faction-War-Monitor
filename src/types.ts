@@ -7,6 +7,9 @@ export interface TornMember {
   level: number;
   rank: string;
   bstats: number;
+  bstatsDisplay: string;   // "2.53b" human-readable
+  bstats_age: string;     // "Updated today" | "2 months old" etc
+  fairFight: number;      // e.g. 23.94
   position: string;
   status: MemberStatus;
   statusDescription: string;
